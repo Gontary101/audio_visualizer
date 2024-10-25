@@ -22,7 +22,7 @@ See `requirements.txt` for a list of required Python packages.
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/your-username/audio-visualizer.git
+   git clone https://github.com/Gontary101/audio-visualizer.git
    ```
 
 2. Navigate to the project directory:
