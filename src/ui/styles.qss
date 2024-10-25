@@ -1,0 +1,65 @@
+/* styles.qss */
+
+/* Main Window */
+QMainWindow {
+    background-color: #333;
+    color: #ECECEC;
+    font-family: Arial, sans-serif;
+    font-size: 10pt;
+}
+
+/* Menu Bar */
+QMenuBar {
+    background-color: #444;
+    color: #ECECEC;
+}
+QMenuBar::item:selected {
+    background-color: #555;
+}
+QMenu::item:selected {
+    background-color: #555;
+}
+
+/* Toolbars */
+QToolBar {
+    background-color: #333;
+    border: 1px solid #222;
+}
+
+/* Buttons */
+QPushButton {
+    background-color: #555;
+    color: #ECECEC;
+    border: 1px solid #444;
+    padding: 5px 10px;
+    border-radius: 4px;
+}
+QPushButton:hover {
+    background-color: #666;
+}
+
+/* Sliders */
+QSlider::groove:horizontal {
+    height: 8px;
+    background-color: #444;
+    border-radius: 4px;
+}
+QSlider::handle:horizontal {
+    width: 12px;
+    background-color: #ECECEC;
+    border-radius: 6px;
+}
+
+/* Dock Widgets */
+QDockWidget {
+    titlebar-close-icon: url(:/icons/close.png);
+    titlebar-normal-icon: url(:/icons/normal.png);
+    background-color: #444;
+    color: #ECECEC;
+}
+
+/* Status Bar */
+QStatusBar {
+    background-color: #333;
+    color: #ECECEC;
+}
