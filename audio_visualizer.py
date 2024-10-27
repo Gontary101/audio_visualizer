@@ -22,7 +22,7 @@ from skimage.transform import resize
 class AudioVisualizer:
     def __init__(self, audio_path, frame_length=2048, fps=30, amplitude_scale=2.0,
                  visualization_type='bars', color='#000000', background_color='#FFFFFF',
-                 aspect_ratio='16:9', orientation='horizontal'):
+                 aspect_ratio='16:9', orientation='horizontal', subsample_factor=1):
         self.audio_path = audio_path
         self.frame_length = frame_length
         self.fps = fps
@@ -32,6 +32,7 @@ class AudioVisualizer:
         self.background_color = background_color
         self.aspect_ratio = aspect_ratio
         self.orientation = orientation
+        self.subsample_factor = subsample_factor
         
         # Parse aspect ratio
         self.width_ratio, self.height_ratio = map(int, self.aspect_ratio.split(':'))
@@ -95,27 +96,32 @@ class AudioVisualizer:
         ax.axis('off')
         fig.patch.set_facecolor(self.background_color)
         
+        # Apply subsampling to reduce crowding
+        indices = range(0, self.frame_length, self.subsample_factor)
+        subsampled_frame = frame[indices]
+        
         if self.visualization_type == 'bars':
             if self.orientation == 'vertical':
-                ax.barh(range(self.frame_length), frame * self.effective_amplitude,
-                       height=1, color=self.color, align='edge')
+                ax.barh(indices, subsampled_frame * self.effective_amplitude,
+                   height=self.subsample_factor, color=self.color, align='edge')
             else:
-                ax.bar(range(self.frame_length), frame * self.effective_amplitude,
-                      width=1, color=self.color, align='edge')
+                ax.bar(indices, subsampled_frame * self.effective_amplitude,
+                  width=self.subsample_factor, color=self.color, align='edge')
         elif self.visualization_type == 'wave':
             if self.orientation == 'vertical':
-                ax.plot(frame * self.effective_amplitude, range(self.frame_length),
-                       color=self.color, linewidth=1.5)
+                ax.plot(subsampled_frame * self.effective_amplitude, indices,
+                   color=self.color, linewidth=1.5)
             else:
-                ax.plot(range(self.frame_length), frame * self.effective_amplitude,
-                       color=self.color, linewidth=1.5)
+                ax.plot(indices, subsampled_frame * self.effective_amplitude,
+                   color=self.color, linewidth=1.5)
         elif self.visualization_type == 'spectrum':
             spec_slice = self.spec_db[:, int(t * self.fps)]
+            subsampled_spec = spec_slice[::self.subsample_factor]
             if self.orientation == 'vertical':
-                ax.imshow([spec_slice], aspect='auto', cmap=plt.cm.get_cmap('viridis'),
+                ax.imshow([subsampled_spec], aspect='auto', cmap=plt.cm.get_cmap('viridis'),
                          origin='lower', interpolation='nearest')
             else:
-                ax.imshow([[spec_slice]], aspect='auto', cmap=plt.cm.get_cmap('viridis'))
+                ax.imshow([[subsampled_spec]], aspect='auto', cmap=plt.cm.get_cmap('viridis'))
         
         # Add time marker
         ax.text(0.02, 0.98, f"Time: {t:.2f}s", transform=ax.transAxes,
@@ -371,6 +377,17 @@ class AudioVisualizerGUI(QMainWindow):
         self.audio_path = None
         self.viz_color = "#000000"
         self.bg_color = "#FFFFFF"
+        
+        # Add this next to other settings in the settings_layout
+        subsample_layout = QVBoxLayout()
+        subsample_layout.addWidget(QLabel("Signal Density:"))
+        self.subsample_spinner = QSpinBox()
+        self.subsample_spinner.setRange(1, 16)  # 1 means no subsampling, 16 means show every 16th signal
+        self.subsample_spinner.setValue(4)  # Default to showing every 4th signal
+        self.subsample_spinner.setToolTip("Higher values will show fewer signals (1 = all signals)")
+        subsample_layout.addWidget(self.subsample_spinner)
+        settings_layout.addLayout(subsample_layout)
+                
 
     def select_audio_file(self):
         file_dialog = QFileDialog()
@@ -420,7 +437,8 @@ class AudioVisualizerGUI(QMainWindow):
                 color=self.viz_color,
                 background_color=self.bg_color,
                 aspect_ratio=self.aspect_ratio.currentText(),
-                orientation=self.orientation.currentText()
+                orientation=self.orientation.currentText(),
+                subsample_factor=self.subsample_spinner.value()
             )
             
             self.generation_thread = VideoGenerationThread(visualizer, output_path)
