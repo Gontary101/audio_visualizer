@@ -1,6 +1,5 @@
 import sys
 import os
-os.environ['QT_QPA_PLATFORM'] = 'xcb'
 import librosa
 import numpy as np
 import matplotlib
