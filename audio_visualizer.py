@@ -10,7 +10,7 @@ from scipy.signal import savgol_filter
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, QFileDialog, 
     QLabel, QVBoxLayout, QHBoxLayout, QWidget, QProgressBar, QSlider, 
     QComboBox, QSpinBox, QColorDialog, QStyle, QSizePolicy, QFrame)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QIcon, QFont, QPalette, QColor
 from moviepy.editor import VideoClip, AudioFileClip, CompositeVideoClip, TextClip
 from moviepy.video.io.bindings import mplfig_to_npimage
@@ -31,7 +31,7 @@ else:  # Unix/Linux/MacOS
     change_settings({"IMAGEMAGICK_BINARY": "convert"})
 
 class AudioVisualizer:
-    def __init__(self, audio_path, frame_length=2048, fps=30, amplitude_scale=2.0,
+    def __init__(self, audio_path, frame_length=2048, fps=30, amplitude_scale=40.0,
                  visualization_type='bars', color='#000000', background_color='#FFFFFF',
                  aspect_ratio='16:9', orientation='horizontal', subsample_factor=1):
         self.audio_path = audio_path
@@ -57,18 +57,22 @@ class AudioVisualizer:
         if self.aspect_ratio == '1:1':
             self.target_width = self.target_height = 1080
         
-            # Adjust figure dimensions based on aspect ratio and orientation
+        # Adjust figure dimensions based on aspect ratio and orientation
         self.calculate_dimensions()
         
         try:
-            self.y, self.sr = librosa.load(audio_path)
+            # Load audio in chunks to reduce memory usage
+            self.y, self.sr = librosa.load(audio_path, sr=None)
             # Apply smoothing to the audio signal
             window_length = 51  # Must be odd
             polyorder = 3
             self.y = savgol_filter(self.y, window_length, polyorder)
             
             self.duration = len(self.y) / self.sr
-            self.spec = librosa.stft(self.y)
+            
+            # Calculate spectrogram in chunks
+            hop_length = self.frame_length // 4
+            self.spec = librosa.stft(self.y, n_fft=self.frame_length, hop_length=hop_length)
             self.spec_db = librosa.amplitude_to_db(np.abs(self.spec))
             
             # Store previous frame data for interpolation
@@ -87,7 +91,7 @@ class AudioVisualizer:
                 return_timestamps=True,
                 generate_kwargs={
                     "task": "transcribe",
-                    "forced_decoder_ids": None  # Remove conflicting forced_decoder_ids
+                    "language": "en"
                 }
             )
             self.subtitles = self.transcription["chunks"]
@@ -124,6 +128,7 @@ class AudioVisualizer:
         frame = 0.7 * frame + 0.3 * self.prev_frame
         self.prev_frame = frame.copy()
         
+        plt.ioff()  # Turn off interactive mode
         fig, ax = plt.subplots(figsize=(self.fig_width, self.fig_height), 
                               facecolor=self.background_color)
         
@@ -149,6 +154,12 @@ class AudioVisualizer:
         if window_length >= 3:
             subsampled_frame = savgol_filter(subsampled_frame, window_length, 2)
         
+        # Add small baseline amplitude when signal is silent
+        min_amplitude = 0.01
+        subsampled_frame = np.where(np.abs(subsampled_frame) < min_amplitude, 
+                                  min_amplitude * np.sign(subsampled_frame + 1e-10), 
+                                  subsampled_frame)
+        
         if self.visualization_type == 'bars':
             if self.orientation == 'vertical':
                 ax.barh(indices, subsampled_frame * self.effective_amplitude,
@@ -166,6 +177,9 @@ class AudioVisualizer:
             else:
                 ax.plot(indices, subsampled_frame * self.effective_amplitude,
                    color=self.color, linewidth=2, alpha=0.8)
+                # Add baseline when signal is very quiet
+                if np.max(np.abs(subsampled_frame)) < min_amplitude:
+                    ax.axhline(y=0, color=self.color, linewidth=1, alpha=0.5)
         elif self.visualization_type == 'spectrum':
             spec_slice = self.spec_db[:, int(t * self.fps)]
             subsampled_spec = spec_slice[::self.subsample_factor]
@@ -184,7 +198,6 @@ class AudioVisualizer:
         img = resize(img, (self.target_height, self.target_width, 3), anti_aliasing=True)
         img = (img * 255).astype(np.uint8)
         return img
-
 
     def create_frames_batch(self, batch):
         return [self.create_frame(t) for t in batch]
@@ -210,7 +223,7 @@ class AudioVisualizer:
             shape = (total_frames, self.target_height, self.target_width, 3)
             mmap_array = np.memmap(tmp_filename, dtype=np.uint8, mode='w+', shape=shape)
 
-        batch_size = 100
+        batch_size = 50  # Reduced batch size for better responsiveness
         num_batches = (total_frames + batch_size - 1) // batch_size
 
         for i in range(num_batches):
@@ -224,6 +237,7 @@ class AudioVisualizer:
             if progress_callback:
                 progress = int((i + 1) / num_batches * 100)
                 progress_callback.emit(progress)
+                QApplication.processEvents()  # Allow GUI updates
 
         def make_frame(t):
             frame_index = min(int(t * self.fps), total_frames - 1)
@@ -232,17 +246,26 @@ class AudioVisualizer:
         video = VideoClip(make_frame, duration=self.duration)
         audio = AudioFileClip(self.audio_path)
         
-        # Create subtitle clips
+        # Create subtitle clips with improved styling
         subtitle_clips = []
         for chunk in self.subtitles:
             start = chunk["timestamp"][0]
             end = chunk["timestamp"][1]
             text = chunk["text"]
             
-            txt_clip = TextClip(text, fontsize=24, color='white', bg_color='rgba(0,0,0,0.5)',
-                               size=(width, None), method='caption')
+            txt_clip = TextClip(
+                text, 
+                fontsize=36,
+                font='Arial-Bold',
+                color=self.color,
+                bg_color=self.background_color,
+                size=(width * 0.8, None),
+                method='caption',
+                stroke_color=self.color,
+                stroke_width=1
+            )
             txt_clip = txt_clip.set_start(start).set_end(end)
-            txt_clip = txt_clip.set_position(('center', 'bottom'))
+            txt_clip = txt_clip.set_position(('center', 0.8), relative=True)
             subtitle_clips.append(txt_clip)
         
         # Combine video with subtitles
@@ -255,11 +278,14 @@ class AudioVisualizer:
             audio_codec='aac',
             audio_bitrate='128k',
             preset='ultrafast',
-            threads=2
+            threads=mp.cpu_count() // 2  # Use half of available CPU cores
         )
 
+        # Clean up
         del mmap_array
         os.unlink(tmp_filename)
+        plt.close('all')  # Close any remaining figures
+
     def create_frames_batch(self,batch):
         return [self.create_frame(t) for t in batch]
 
@@ -376,7 +402,6 @@ class AudioVisualizerGUI(QMainWindow):
         fps_layout.addWidget(self.fps_spinner)
         settings_layout.addLayout(fps_layout)
         
-        
         # Aspect ratio settings
         aspect_layout = QVBoxLayout()
         aspect_layout.addWidget(QLabel("Aspect Ratio:"))
@@ -410,11 +435,11 @@ class AudioVisualizerGUI(QMainWindow):
         amplitude_layout = QVBoxLayout()
         amplitude_layout.addWidget(QLabel("Amplitude Scale:"))
         self.amplitude_slider = QSlider(Qt.Horizontal)
-        self.amplitude_slider.setMinimum(10)
-        self.amplitude_slider.setMaximum(50)
-        self.amplitude_slider.setValue(20)
+        self.amplitude_slider.setMinimum(100)
+        self.amplitude_slider.setMaximum(1000)
+        self.amplitude_slider.setValue(400)
         self.amplitude_slider.setTickPosition(QSlider.TicksBelow)
-        self.amplitude_slider.setTickInterval(10)
+        self.amplitude_slider.setTickInterval(100)
         amplitude_layout.addWidget(self.amplitude_slider)
         layout.addLayout(amplitude_layout)
         
@@ -445,16 +470,20 @@ class AudioVisualizerGUI(QMainWindow):
         self.viz_color = "#000000"
         self.bg_color = "#FFFFFF"
         
-        # Add this next to other settings in the settings_layout
+        # Add signal density control
         subsample_layout = QVBoxLayout()
         subsample_layout.addWidget(QLabel("Signal Density:"))
         self.subsample_spinner = QSpinBox()
-        self.subsample_spinner.setRange(1, 16)  # 1 means no subsampling, 16 means show every 16th signal
-        self.subsample_spinner.setValue(4)  # Default to showing every 4th signal
+        self.subsample_spinner.setRange(1, 16)
+        self.subsample_spinner.setValue(4)
         self.subsample_spinner.setToolTip("Higher values will show fewer signals (1 = all signals)")
         subsample_layout.addWidget(self.subsample_spinner)
         settings_layout.addLayout(subsample_layout)
-                
+        
+        # Add timer for UI updates
+        self.update_timer = QTimer()
+        self.update_timer.timeout.connect(lambda: QApplication.processEvents())
+        self.update_timer.start(100)  # Update every 100ms
 
     def select_audio_file(self):
         file_dialog = QFileDialog()
@@ -486,15 +515,12 @@ class AudioVisualizerGUI(QMainWindow):
         output_path, _ = QFileDialog.getSaveFileName(
             self, "Save Video As", "", "MP4 Files (*.mp4)")
         
-        
         if not output_path:
             return
         
-        elif not output_path.endswith(".mp4"):
-    # Ensure the file has the .mp4 extension if not provided
+        if not output_path.endswith(".mp4"):
             output_path += ".mp4"
 
-        # Create visualizer with current settings
         try:
             visualizer = AudioVisualizer(
                 self.audio_path,
@@ -523,6 +549,7 @@ class AudioVisualizerGUI(QMainWindow):
 
     def update_progress(self, value):
         self.progress_bar.setValue(value)
+        QApplication.processEvents()
 
     def generation_finished(self):
         self.generate_button.setEnabled(True)
@@ -533,8 +560,6 @@ class AudioVisualizerGUI(QMainWindow):
         self.generate_button.setEnabled(True)
         self.status_label.setText(f"Error: {error_message}")
         self.progress_bar.setValue(0)
-        
-
 
 if __name__ == '__main__':
     # Set up logging
@@ -543,10 +568,7 @@ if __name__ == '__main__':
     
     try:
         app = QApplication(sys.argv)
-        
-        # Set application-wide style
         app.setStyle('Fusion')
-        
         window = AudioVisualizerGUI()
         window.show()
         sys.exit(app.exec_())
