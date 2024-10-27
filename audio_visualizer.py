@@ -9,18 +9,16 @@ from scipy.signal import savgol_filter
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, QFileDialog, 
     QLabel, QVBoxLayout, QHBoxLayout, QWidget, QProgressBar, QSlider, 
-    QComboBox, QSpinBox, QColorDialog, QStyle, QSizePolicy, QFrame)
+    QComboBox, QSpinBox, QColorDialog, QStyle)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
-from PyQt5.QtGui import QIcon, QFont, QPalette, QColor
+from PyQt5.QtGui import QFont
 from moviepy.editor import VideoClip, AudioFileClip, CompositeVideoClip, TextClip
 from moviepy.video.io.bindings import mplfig_to_npimage
 from moviepy.config import change_settings
 import multiprocessing as mp
-from functools import partial
 import tempfile
 import logging
 from skimage.transform import resize
-import datetime
 from transformers import pipeline
 import torch
 
@@ -29,7 +27,6 @@ if os.name == 'nt':  # Windows
     change_settings({"IMAGEMAGICK_BINARY": r"C:\Program Files\ImageMagick-7.0.10-Q16\magick.exe"})
 else:  # Unix/Linux/MacOS
     change_settings({"IMAGEMAGICK_BINARY": "convert"})
-
 class AudioVisualizer:
     def __init__(self, audio_path, frame_length=2048, fps=30, amplitude_scale=40.0,
                  visualization_type='bars', color='#000000', background_color='#FFFFFF',
