@@ -12,13 +12,23 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, QFileDialog
     QComboBox, QSpinBox, QColorDialog, QStyle, QSizePolicy, QFrame)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QIcon, QFont, QPalette, QColor
-from moviepy.editor import VideoClip, AudioFileClip, CompositeVideoClip
+from moviepy.editor import VideoClip, AudioFileClip, CompositeVideoClip, TextClip
 from moviepy.video.io.bindings import mplfig_to_npimage
+from moviepy.config import change_settings
 import multiprocessing as mp
 from functools import partial
 import tempfile
 import logging
 from skimage.transform import resize
+import datetime
+from transformers import pipeline
+import torch
+
+# Configure MoviePy to use ImageMagick
+if os.name == 'nt':  # Windows
+    change_settings({"IMAGEMAGICK_BINARY": r"C:\Program Files\ImageMagick-7.0.10-Q16\magick.exe"})
+else:  # Unix/Linux/MacOS
+    change_settings({"IMAGEMAGICK_BINARY": "convert"})
 
 class AudioVisualizer:
     def __init__(self, audio_path, frame_length=2048, fps=30, amplitude_scale=2.0,
@@ -63,6 +73,25 @@ class AudioVisualizer:
             
             # Store previous frame data for interpolation
             self.prev_frame = np.zeros(self.frame_length)
+            
+            # Generate subtitles using Whisper
+            pipe = pipeline(
+                "automatic-speech-recognition", 
+                model="openai/whisper-large-v3-turbo",
+                chunk_length_s=30,
+                device="cuda" if torch.cuda.is_available() else "cpu"
+            )
+            
+            self.transcription = pipe(
+                audio_path, 
+                return_timestamps=True,
+                generate_kwargs={
+                    "task": "transcribe",
+                    "forced_decoder_ids": None  # Remove conflicting forced_decoder_ids
+                }
+            )
+            self.subtitles = self.transcription["chunks"]
+            
         except Exception as e:
             logging.error(f"Error loading audio file: {e}")
             raise
@@ -202,7 +231,22 @@ class AudioVisualizer:
 
         video = VideoClip(make_frame, duration=self.duration)
         audio = AudioFileClip(self.audio_path)
-        final_video = CompositeVideoClip([video.set_audio(audio)])
+        
+        # Create subtitle clips
+        subtitle_clips = []
+        for chunk in self.subtitles:
+            start = chunk["timestamp"][0]
+            end = chunk["timestamp"][1]
+            text = chunk["text"]
+            
+            txt_clip = TextClip(text, fontsize=24, color='white', bg_color='rgba(0,0,0,0.5)',
+                               size=(width, None), method='caption')
+            txt_clip = txt_clip.set_start(start).set_end(end)
+            txt_clip = txt_clip.set_position(('center', 'bottom'))
+            subtitle_clips.append(txt_clip)
+        
+        # Combine video with subtitles
+        final_video = CompositeVideoClip([video.set_audio(audio)] + subtitle_clips)
 
         final_video.write_videofile(
             output_path,
@@ -489,6 +533,8 @@ class AudioVisualizerGUI(QMainWindow):
         self.generate_button.setEnabled(True)
         self.status_label.setText(f"Error: {error_message}")
         self.progress_bar.setValue(0)
+        
+
 
 if __name__ == '__main__':
     # Set up logging
