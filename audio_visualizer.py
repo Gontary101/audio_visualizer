@@ -5,6 +5,7 @@ import numpy as np
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from scipy.signal import savgol_filter
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, QFileDialog, 
     QLabel, QVBoxLayout, QHBoxLayout, QWidget, QProgressBar, QSlider, 
@@ -47,13 +48,21 @@ class AudioVisualizer:
             self.target_width = self.target_height = 1080
         
             # Adjust figure dimensions based on aspect ratio and orientation
-            self.calculate_dimensions()
+        self.calculate_dimensions()
         
         try:
             self.y, self.sr = librosa.load(audio_path)
+            # Apply smoothing to the audio signal
+            window_length = 51  # Must be odd
+            polyorder = 3
+            self.y = savgol_filter(self.y, window_length, polyorder)
+            
             self.duration = len(self.y) / self.sr
             self.spec = librosa.stft(self.y)
             self.spec_db = librosa.amplitude_to_db(np.abs(self.spec))
+            
+            # Store previous frame data for interpolation
+            self.prev_frame = np.zeros(self.frame_length)
         except Exception as e:
             logging.error(f"Error loading audio file: {e}")
             raise
@@ -81,6 +90,10 @@ class AudioVisualizer:
         
         if len(frame) < self.frame_length:
             frame = np.pad(frame, (0, self.frame_length - len(frame)))
+            
+        # Interpolate between previous and current frame for smoother transitions
+        frame = 0.7 * frame + 0.3 * self.prev_frame
+        self.prev_frame = frame.copy()
         
         fig, ax = plt.subplots(figsize=(self.fig_width, self.fig_height), 
                               facecolor=self.background_color)
@@ -96,24 +109,34 @@ class AudioVisualizer:
         ax.axis('off')
         fig.patch.set_facecolor(self.background_color)
         
-        # Apply subsampling to reduce crowding
+        # Apply subsampling and additional smoothing
         indices = range(0, self.frame_length, self.subsample_factor)
         subsampled_frame = frame[indices]
+        
+        # Additional smoothing for visualization
+        window_length = min(15, len(subsampled_frame) - 1)
+        if window_length % 2 == 0:
+            window_length -= 1
+        if window_length >= 3:
+            subsampled_frame = savgol_filter(subsampled_frame, window_length, 2)
         
         if self.visualization_type == 'bars':
             if self.orientation == 'vertical':
                 ax.barh(indices, subsampled_frame * self.effective_amplitude,
-                   height=self.subsample_factor, color=self.color, align='edge')
+                   height=self.subsample_factor * 0.8,  # Reduced bar width for aesthetics
+                   color=self.color, align='edge', alpha=0.8)  # Added transparency
             else:
                 ax.bar(indices, subsampled_frame * self.effective_amplitude,
-                  width=self.subsample_factor, color=self.color, align='edge')
+                  width=self.subsample_factor * 0.8,  # Reduced bar width for aesthetics
+                  color=self.color, align='edge', alpha=0.8)  # Added transparency
         elif self.visualization_type == 'wave':
+            # Use cubic interpolation for smoother wave
             if self.orientation == 'vertical':
                 ax.plot(subsampled_frame * self.effective_amplitude, indices,
-                   color=self.color, linewidth=1.5)
+                   color=self.color, linewidth=2, alpha=0.8)
             else:
                 ax.plot(indices, subsampled_frame * self.effective_amplitude,
-                   color=self.color, linewidth=1.5)
+                   color=self.color, linewidth=2, alpha=0.8)
         elif self.visualization_type == 'spectrum':
             spec_slice = self.spec_db[:, int(t * self.fps)]
             subsampled_spec = spec_slice[::self.subsample_factor]
