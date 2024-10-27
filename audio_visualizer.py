@@ -1,24 +1,79 @@
 import sys
 import os
+os.environ['QT_QPA_PLATFORM'] = 'xcb'
 import librosa
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from PyQt5.QtWidgets import QApplication, QMainWindow, QPushButton, QFileDialog, QLabel, QVBoxLayout, QWidget, QProgressBar, QSlider
+
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, QFileDialog, 
+    QLabel, QVBoxLayout, QHBoxLayout, QWidget, QProgressBar, QSlider, 
+    QComboBox, QSpinBox, QColorDialog, QStyle, QSizePolicy, QFrame)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtGui import QIcon, QFont, QPalette, QColor
 from moviepy.editor import VideoClip, AudioFileClip, CompositeVideoClip
 from moviepy.video.io.bindings import mplfig_to_npimage
 import multiprocessing as mp
 from functools import partial
+import tempfile
+import logging
+from skimage.transform import resize
 
 class AudioVisualizer:
-    def __init__(self, audio_path, frame_length=1000, fps=30, amplitude_scale=2.0):
+    def __init__(self, audio_path, frame_length=2048, fps=30, amplitude_scale=2.0,
+                 visualization_type='bars', color='#000000', background_color='#FFFFFF',
+                 aspect_ratio='16:9', orientation='horizontal'):
         self.audio_path = audio_path
         self.frame_length = frame_length
         self.fps = fps
         self.amplitude_scale = amplitude_scale
-        self.y, self.sr = librosa.load(audio_path)
-        self.duration = len(self.y) / self.sr
+        self.visualization_type = visualization_type
+        self.color = color
+        self.background_color = background_color
+        self.aspect_ratio = aspect_ratio
+        self.orientation = orientation
+        
+        # Parse aspect ratio
+        self.width_ratio, self.height_ratio = map(int, self.aspect_ratio.split(':'))
+        if self.orientation == 'horizontal':
+            self.target_width = 1920 if self.aspect_ratio == '16:9' else 1440  # 1440 for 4:3
+            self.target_height = self.target_width * self.height_ratio // self.width_ratio
+        else:
+            self.target_height = 1920 if self.aspect_ratio == '16:9' else 1440
+            self.target_width = self.target_height * self.height_ratio // self.width_ratio
 
+        if self.aspect_ratio == '1:1':
+            self.target_width = self.target_height = 1080
+        
+            # Adjust figure dimensions based on aspect ratio and orientation
+            self.calculate_dimensions()
+        
+        try:
+            self.y, self.sr = librosa.load(audio_path)
+            self.duration = len(self.y) / self.sr
+            self.spec = librosa.stft(self.y)
+            self.spec_db = librosa.amplitude_to_db(np.abs(self.spec))
+        except Exception as e:
+            logging.error(f"Error loading audio file: {e}")
+            raise
+
+    def calculate_dimensions(self):
+        base_size = 10  # Base size for scaling
+        
+        if self.orientation == 'horizontal':
+            self.fig_width = base_size
+            self.fig_height = (base_size * self.height_ratio) / self.width_ratio
+        else:  # vertical
+            self.fig_width = (base_size * self.height_ratio) / self.width_ratio
+            self.fig_height = base_size
+            
+        # Adjust amplitude scale for square aspect ratio
+        if self.aspect_ratio == '1:1':
+            self.effective_amplitude = self.amplitude_scale * 1.5
+        else:
+            self.effective_amplitude = self.amplitude_scale
+            
     def create_frame(self, t):
         start_sample = int(t * self.sr)
         end_sample = min(start_sample + self.frame_length, len(self.y))
@@ -27,16 +82,52 @@ class AudioVisualizer:
         if len(frame) < self.frame_length:
             frame = np.pad(frame, (0, self.frame_length - len(frame)))
         
-        fig, ax = plt.subplots(figsize=(10, 2))
-        ax.set_ylim(-self.amplitude_scale, self.amplitude_scale)
-        ax.set_xlim(0, self.frame_length)
-        ax.axis('off')
+        fig, ax = plt.subplots(figsize=(self.fig_width, self.fig_height), 
+                              facecolor=self.background_color)
         
-        bars = ax.bar(range(self.frame_length), frame * self.amplitude_scale, width=1, color='black', align='edge')
+        # Adjust plot based on orientation
+        if self.orientation == 'vertical':
+            ax.set_xlim(-self.effective_amplitude, self.effective_amplitude)
+            ax.set_ylim(0, self.frame_length)
+        else:
+            ax.set_ylim(-self.effective_amplitude, self.effective_amplitude)
+            ax.set_xlim(0, self.frame_length)
+            
+        ax.axis('off')
+        fig.patch.set_facecolor(self.background_color)
+        
+        if self.visualization_type == 'bars':
+            if self.orientation == 'vertical':
+                ax.barh(range(self.frame_length), frame * self.effective_amplitude,
+                       height=1, color=self.color, align='edge')
+            else:
+                ax.bar(range(self.frame_length), frame * self.effective_amplitude,
+                      width=1, color=self.color, align='edge')
+        elif self.visualization_type == 'wave':
+            if self.orientation == 'vertical':
+                ax.plot(frame * self.effective_amplitude, range(self.frame_length),
+                       color=self.color, linewidth=1.5)
+            else:
+                ax.plot(range(self.frame_length), frame * self.effective_amplitude,
+                       color=self.color, linewidth=1.5)
+        elif self.visualization_type == 'spectrum':
+            spec_slice = self.spec_db[:, int(t * self.fps)]
+            if self.orientation == 'vertical':
+                ax.imshow([spec_slice], aspect='auto', cmap=plt.cm.get_cmap('viridis'),
+                         origin='lower', interpolation='nearest')
+            else:
+                ax.imshow([[spec_slice]], aspect='auto', cmap=plt.cm.get_cmap('viridis'))
+        
+        # Add time marker
+        ax.text(0.02, 0.98, f"Time: {t:.2f}s", transform=ax.transAxes,
+                color=self.color, fontsize=10, alpha=0.7)
         
         img = mplfig_to_npimage(fig)
         plt.close(fig)
+        img = resize(img, (self.target_height, self.target_width, 3), anti_aliasing=True)
+        img = (img * 255).astype(np.uint8)
         return img
+
 
     def create_frames_batch(self, batch):
         return [self.create_frame(t) for t in batch]
@@ -45,30 +136,65 @@ class AudioVisualizer:
         total_frames = int(self.duration * self.fps)
         time_points = np.linspace(0, self.duration, total_frames, endpoint=False)
 
-        num_cores = mp.cpu_count()
-        batches = np.array_split(time_points, num_cores)
+        # Calculate output dimensions based on aspect ratio
+        if self.orientation == 'horizontal':
+            width = 1920 if self.aspect_ratio == '16:9' else 1440  # 1440 for 4:3
+            height = width * self.height_ratio // self.width_ratio
+        else:
+            height = 1920 if self.aspect_ratio == '16:9' else 1440
+            width = height * self.height_ratio // self.width_ratio
 
-        with mp.Pool(num_cores) as pool:
-            frames = []
-            for i, batch_frames in enumerate(pool.imap(self.create_frames_batch, batches)):
-                frames.extend(batch_frames)
-                if progress_callback:
-                    progress = int((i + 1) / len(batches) * 100)
-                    progress_callback.emit(progress)
+        if self.aspect_ratio == '1:1':
+            width = height = 1080
+
+        # Create memory-mapped temporary file
+        with tempfile.NamedTemporaryFile(suffix='.mmap', delete=False) as tmp:
+            tmp_filename = tmp.name
+            shape = (total_frames, self.target_height, self.target_width, 3)
+            mmap_array = np.memmap(tmp_filename, dtype=np.uint8, mode='w+', shape=shape)
+
+        batch_size = 100
+        num_batches = (total_frames + batch_size - 1) // batch_size
+
+        for i in range(num_batches):
+            start = i * batch_size
+            end = min((i + 1) * batch_size, total_frames)
+            batch = time_points[start:end]
+            
+            frames = self.create_frames_batch(batch)
+            mmap_array[start:end] = [np.array(frame) for frame in frames]
+
+            if progress_callback:
+                progress = int((i + 1) / num_batches * 100)
+                progress_callback.emit(progress)
 
         def make_frame(t):
-            frame_index = min(int(t * self.fps), len(frames) - 1)
-            return frames[frame_index]
+            frame_index = min(int(t * self.fps), total_frames - 1)
+            return mmap_array[frame_index]
 
         video = VideoClip(make_frame, duration=self.duration)
         audio = AudioFileClip(self.audio_path)
         final_video = CompositeVideoClip([video.set_audio(audio)])
 
-        final_video.write_videofile(output_path, fps=self.fps, audio_codec='aac')
+        final_video.write_videofile(
+            output_path,
+            fps=self.fps,
+            codec='libx264',
+            audio_codec='aac',
+            audio_bitrate='128k',
+            preset='ultrafast',
+            threads=2
+        )
+
+        del mmap_array
+        os.unlink(tmp_filename)
+    def create_frames_batch(self,batch):
+        return [self.create_frame(t) for t in batch]
 
 class VideoGenerationThread(QThread):
     progress_updated = pyqtSignal(int)
     finished = pyqtSignal()
+    error = pyqtSignal(str)
 
     def __init__(self, visualizer, output_path):
         super().__init__()
@@ -76,74 +202,240 @@ class VideoGenerationThread(QThread):
         self.output_path = output_path
 
     def run(self):
-        self.visualizer.generate_video(self.output_path, self.progress_updated)
-        self.finished.emit()
+        try:
+            self.visualizer.generate_video(self.output_path, self.progress_updated)
+            self.finished.emit()
+        except Exception as e:
+            self.error.emit(str(e))
+
+class StyleableWidget(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #f0f0f0;
+                color: #333333;
+            }
+            QPushButton {
+                background-color: #2196F3;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #1976D2;
+            }
+            QPushButton:disabled {
+                background-color: #BDBDBD;
+            }
+            QProgressBar {
+                border: 2px solid #2196F3;
+                border-radius: 5px;
+                text-align: center;
+            }
+            QProgressBar::chunk {
+                background-color: #2196F3;
+            }
+            QSlider::groove:horizontal {
+                border: 1px solid #999999;
+                height: 8px;
+                background: #ffffff;
+                margin: 2px 0;
+                border-radius: 4px;
+            }
+            QSlider::handle:horizontal {
+                background: #2196F3;
+                border: 1px solid #5c5c5c;
+                width: 18px;
+                margin: -2px 0;
+                border-radius: 9px;
+            }
+        """)
 
 class AudioVisualizerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Audio Visualizer")
-        self.setGeometry(100, 100, 400, 300)
+        self.setWindowTitle("Advanced Audio Visualizer")
+        self.setGeometry(100, 100, 600, 400)
         self.initUI()
 
     def initUI(self):
+        main_widget = StyleableWidget()
+        self.setCentralWidget(main_widget)
+        
         layout = QVBoxLayout()
-
+        
+        # Header
+        header = QLabel("Advanced Audio Visualizer")
+        header.setFont(QFont("Arial", 16, QFont.Bold))
+        header.setAlignment(Qt.AlignCenter)
+        layout.addWidget(header)
+        
+        # File selection area
+        file_layout = QHBoxLayout()
         self.input_label = QLabel("No audio file selected")
-        layout.addWidget(self.input_label)
-
-        self.select_button = QPushButton("Select Audio File")
-        self.select_button.clicked.connect(self.select_audio_file)
-        layout.addWidget(self.select_button)
-
+        self.input_label.setStyleSheet("padding: 8px; background: white; border-radius: 4px;")
+        file_layout.addWidget(self.input_label)
+        
+        self.select_button = QPushButton("Select Audio")
+        self.select_button.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))
+        file_layout.addWidget(self.select_button)
+        layout.addLayout(file_layout)
+        
+        # Settings group
+        settings_layout = QHBoxLayout()
+        
+        # Visualization type
+        viz_layout = QVBoxLayout()
+        viz_layout.addWidget(QLabel("Visualization Type:"))
+        self.viz_type = QComboBox()
+        self.viz_type.addItems(['bars', 'wave', 'spectrum'])
+        viz_layout.addWidget(self.viz_type)
+        settings_layout.addLayout(viz_layout)
+        
+        # FPS setting
+        fps_layout = QVBoxLayout()
+        fps_layout.addWidget(QLabel("FPS:"))
+        self.fps_spinner = QSpinBox()
+        self.fps_spinner.setRange(1, 60)
+        self.fps_spinner.setValue(15)
+        fps_layout.addWidget(self.fps_spinner)
+        settings_layout.addLayout(fps_layout)
+        
+        
+        # Aspect ratio settings
+        aspect_layout = QVBoxLayout()
+        aspect_layout.addWidget(QLabel("Aspect Ratio:"))
+        self.aspect_ratio = QComboBox()
+        self.aspect_ratio.addItems(['16:9', '4:3', '1:1'])
+        aspect_layout.addWidget(self.aspect_ratio)
+        settings_layout.addLayout(aspect_layout)
+        
+        # Orientation settings
+        orientation_layout = QVBoxLayout()
+        orientation_layout.addWidget(QLabel("Orientation:"))
+        self.orientation = QComboBox()
+        self.orientation.addItems(['horizontal', 'vertical'])
+        orientation_layout.addWidget(self.orientation)
+        settings_layout.addLayout(orientation_layout)
+        
+        # Color settings
+        colors_layout = QVBoxLayout()
+        colors_layout.addWidget(QLabel("Colors:"))
+        color_buttons = QHBoxLayout()
+        self.color_button = QPushButton("Viz Color")
+        self.bg_color_button = QPushButton("BG Color")
+        color_buttons.addWidget(self.color_button)
+        color_buttons.addWidget(self.bg_color_button)
+        colors_layout.addLayout(color_buttons)
+        settings_layout.addLayout(colors_layout)
+        
+        layout.addLayout(settings_layout)
+        
+        # Amplitude scale
+        amplitude_layout = QVBoxLayout()
+        amplitude_layout.addWidget(QLabel("Amplitude Scale:"))
         self.amplitude_slider = QSlider(Qt.Horizontal)
         self.amplitude_slider.setMinimum(10)
         self.amplitude_slider.setMaximum(50)
         self.amplitude_slider.setValue(20)
         self.amplitude_slider.setTickPosition(QSlider.TicksBelow)
         self.amplitude_slider.setTickInterval(10)
-        layout.addWidget(QLabel("Amplitude Scale:"))
-        layout.addWidget(self.amplitude_slider)
-
+        amplitude_layout.addWidget(self.amplitude_slider)
+        layout.addLayout(amplitude_layout)
+        
+        # Generate button and progress bar
         self.generate_button = QPushButton("Generate Video")
-        self.generate_button.clicked.connect(self.generate_video)
+        self.generate_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
         self.generate_button.setEnabled(False)
         layout.addWidget(self.generate_button)
-
+        
         self.progress_bar = QProgressBar()
         layout.addWidget(self.progress_bar)
-
-        container = QWidget()
-        container.setLayout(layout)
-        self.setCentralWidget(container)
-
+        
+        # Status label
+        self.status_label = QLabel("")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.status_label)
+        
+        main_widget.setLayout(layout)
+        
+        # Connect signals
+        self.select_button.clicked.connect(self.select_audio_file)
+        self.generate_button.clicked.connect(self.generate_video)
+        self.color_button.clicked.connect(self.select_color)
+        self.bg_color_button.clicked.connect(self.select_bg_color)
+        
+        # Initialize variables
         self.audio_path = None
+        self.viz_color = "#000000"
+        self.bg_color = "#FFFFFF"
 
     def select_audio_file(self):
         file_dialog = QFileDialog()
-        self.audio_path, _ = file_dialog.getOpenFileName(self, "Select Audio File", "", "Audio Files (*.mp3 *.wav)")
+        self.audio_path, _ = file_dialog.getOpenFileName(
+            self, "Select Audio File", "", 
+            "Audio Files (*.mp3 *.wav *.m4a *.ogg *.flac)")
+        
         if self.audio_path:
             self.input_label.setText(f"Selected: {os.path.basename(self.audio_path)}")
             self.generate_button.setEnabled(True)
+            self.status_label.setText("Ready to generate video")
+
+    def select_color(self):
+        color = QColorDialog.getColor()
+        if color.isValid():
+            self.viz_color = color.name()
+            self.color_button.setStyleSheet(f"background-color: {self.viz_color};")
+
+    def select_bg_color(self):
+        color = QColorDialog.getColor()
+        if color.isValid():
+            self.bg_color = color.name()
+            self.bg_color_button.setStyleSheet(f"background-color: {self.bg_color};")
 
     def generate_video(self):
         if not self.audio_path:
             return
 
-        output_path, _ = QFileDialog.getSaveFileName(self, "Save Video As", "", "MP4 Files (*.mp4)")
+        output_path, _ = QFileDialog.getSaveFileName(
+            self, "Save Video As", "", "MP4 Files (*.mp4)")
+        
+        
         if not output_path:
             return
+        
+        elif not output_path.endswith(".mp4"):
+    # Ensure the file has the .mp4 extension if not provided
+            output_path += ".mp4"
 
-        amplitude_scale = self.amplitude_slider.value() / 10
-        visualizer = AudioVisualizer(self.audio_path, amplitude_scale=amplitude_scale)
-        
-        self.generation_thread = VideoGenerationThread(visualizer, output_path)
-        self.generation_thread.progress_updated.connect(self.update_progress)
-        self.generation_thread.finished.connect(self.generation_finished)
-        
-        self.generate_button.setEnabled(False)
-        self.progress_bar.setValue(0)
-        self.generation_thread.start()
+        # Create visualizer with current settings
+        try:
+            visualizer = AudioVisualizer(
+                self.audio_path,
+                fps=self.fps_spinner.value(),
+                amplitude_scale=self.amplitude_slider.value() / 10,
+                visualization_type=self.viz_type.currentText(),
+                color=self.viz_color,
+                background_color=self.bg_color,
+                aspect_ratio=self.aspect_ratio.currentText(),
+                orientation=self.orientation.currentText()
+            )
+            
+            self.generation_thread = VideoGenerationThread(visualizer, output_path)
+            self.generation_thread.progress_updated.connect(self.update_progress)
+            self.generation_thread.finished.connect(self.generation_finished)
+            self.generation_thread.error.connect(self.handle_error)
+            
+            self.generate_button.setEnabled(False)
+            self.progress_bar.setValue(0)
+            self.status_label.setText("Generating video...")
+            self.generation_thread.start()
+            
+        except Exception as e:
+            self.handle_error(str(e))
 
     def update_progress(self, value):
         self.progress_bar.setValue(value)
@@ -151,9 +443,27 @@ class AudioVisualizerGUI(QMainWindow):
     def generation_finished(self):
         self.generate_button.setEnabled(True)
         self.progress_bar.setValue(100)
+        self.status_label.setText("Video generation completed successfully!")
+
+    def handle_error(self, error_message):
+        self.generate_button.setEnabled(True)
+        self.status_label.setText(f"Error: {error_message}")
+        self.progress_bar.setValue(0)
 
 if __name__ == '__main__':
-    app = QApplication(sys.argv)
-    window = AudioVisualizerGUI()
-    window.show()
-    sys.exit(app.exec_())
+    # Set up logging
+    logging.basicConfig(level=logging.INFO,
+                       format='%(asctime)s - %(levelname)s - %(message)s')
+    
+    try:
+        app = QApplication(sys.argv)
+        
+        # Set application-wide style
+        app.setStyle('Fusion')
+        
+        window = AudioVisualizerGUI()
+        window.show()
+        sys.exit(app.exec_())
+    except Exception as e:
+        logging.error(f"Application error: {e}")
+        sys.exit(1)
