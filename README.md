@@ -18,7 +18,7 @@ A Python-based desktop application that creates beautiful visualizations from au
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/audio-visualizer.git
+git clone https://github.com/Gontary101/audio-visualizer.git
 cd audio-visualizer
 ```
 
