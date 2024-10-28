@@ -6,6 +6,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy.signal import savgol_filter
+import cupy as cp
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, QFileDialog, 
     QLabel, QVBoxLayout, QHBoxLayout, QWidget, QProgressBar, QSlider, 
@@ -21,12 +22,41 @@ import logging
 from skimage.transform import resize
 from transformers import pipeline
 import torch
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
 # Configure MoviePy to use ImageMagick
 if os.name == 'nt':  # Windows
     change_settings({"IMAGEMAGICK_BINARY": r"C:\Program Files\ImageMagick-7.0.10-Q16\magick.exe"})
 else:  # Unix/Linux/MacOS
     change_settings({"IMAGEMAGICK_BINARY": "convert"})
+
+# GPU accelerated signal processing functions
+def process_audio_gpu(audio_data):
+    # Transfer data to GPU
+    audio_gpu = cp.asarray(audio_data)
+    # Process on GPU
+    processed = cp.abs(audio_gpu)
+    # Return to CPU
+    return cp.asnumpy(processed)
+
+def apply_savgol(data, window_length, polyorder):
+    return savgol_filter(data, window_length, polyorder)
+
+def parallel_savgol(data, window_length, polyorder):
+    # Split data into chunks for parallel processing
+    n_cores = mp.cpu_count()
+    chunk_size = len(data) // n_cores
+    chunks = [data[i:i + chunk_size] for i in range(0, len(data), chunk_size)]
+    
+    with ProcessPoolExecutor(max_workers=n_cores) as executor:
+        results = list(executor.map(
+            apply_savgol,
+            chunks,
+            [window_length] * len(chunks),
+            [polyorder] * len(chunks)
+        ))
+    return np.concatenate(results)
+
 class AudioVisualizer:
     def __init__(self, audio_path, frame_length=2048, fps=30, amplitude_scale=40.0,
                  visualization_type='bars', color='#000000', background_color='#FFFFFF',
@@ -45,7 +75,7 @@ class AudioVisualizer:
         # Parse aspect ratio
         self.width_ratio, self.height_ratio = map(int, self.aspect_ratio.split(':'))
         if self.orientation == 'horizontal':
-            self.target_width = 1920 if self.aspect_ratio == '16:9' else 1440  # 1440 for 4:3
+            self.target_width = 1920 if self.aspect_ratio == '16:9' else 1440
             self.target_height = self.target_width * self.height_ratio // self.width_ratio
         else:
             self.target_height = 1920 if self.aspect_ratio == '16:9' else 1440
@@ -54,37 +84,42 @@ class AudioVisualizer:
         if self.aspect_ratio == '1:1':
             self.target_width = self.target_height = 1080
         
-        # Adjust figure dimensions based on aspect ratio and orientation
         self.calculate_dimensions()
         
         try:
-            # Load audio in chunks to reduce memory usage
+            # Load and process audio using GPU acceleration
             self.y, self.sr = librosa.load(audio_path, sr=None)
-            # Apply smoothing to the audio signal
-            window_length = 51  # Must be odd
+            
+            # Process audio on GPU
+            self.y = process_audio_gpu(self.y)
+            
+            # Parallel smoothing using all CPU cores
+            window_length = 51
             polyorder = 3
-            self.y = savgol_filter(self.y, window_length, polyorder)
+            self.y = parallel_savgol(self.y, window_length, polyorder)
             
             self.duration = len(self.y) / self.sr
             
-            # Calculate spectrogram in chunks
+            # Calculate spectrogram using GPU
             hop_length = self.frame_length // 4
-            self.spec = librosa.stft(self.y, n_fft=self.frame_length, hop_length=hop_length)
+            # Transfer to GPU
+            y_gpu = cp.asarray(self.y)
+            self.spec = cp.asnumpy(cp.fft.rfft(y_gpu))
             self.spec_db = librosa.amplitude_to_db(np.abs(self.spec))
             
-            # Store previous frame data for interpolation
-            self.prev_frame = np.zeros(self.frame_length)
+            # Store previous frame data
+            self.prev_frame = cp.zeros(self.frame_length)
             
-            # Generate subtitles using Whisper
+            # Generate subtitles using GPU-accelerated Whisper
             pipe = pipeline(
-                "automatic-speech-recognition", 
-                model="openai/whisper-large-v3-turbo",
+                "automatic-speech-recognition",
+                model="openai/whisper-large-v3-turbo", 
                 chunk_length_s=30,
                 device="cuda" if torch.cuda.is_available() else "cpu"
             )
             
             self.transcription = pipe(
-                audio_path, 
+                audio_path,
                 return_timestamps=True,
                 generate_kwargs={
                     "task": "transcribe",
@@ -98,16 +133,15 @@ class AudioVisualizer:
             raise
 
     def calculate_dimensions(self):
-        base_size = 10  # Base size for scaling
+        base_size = 10
         
         if self.orientation == 'horizontal':
             self.fig_width = base_size
             self.fig_height = (base_size * self.height_ratio) / self.width_ratio
-        else:  # vertical
+        else:
             self.fig_width = (base_size * self.height_ratio) / self.width_ratio
             self.fig_height = base_size
             
-        # Adjust amplitude scale for square aspect ratio
         if self.aspect_ratio == '1:1':
             self.effective_amplitude = self.amplitude_scale * 1.5
         else:
@@ -119,17 +153,19 @@ class AudioVisualizer:
         frame = self.y[start_sample:end_sample]
         
         if len(frame) < self.frame_length:
-            frame = np.pad(frame, (0, self.frame_length - len(frame)))
+            frame = cp.pad(frame, (0, self.frame_length - len(frame)))
             
-        # Interpolate between previous and current frame for smoother transitions
-        frame = 0.7 * frame + 0.3 * self.prev_frame
-        self.prev_frame = frame.copy()
+        # GPU-accelerated frame interpolation
+        frame_gpu = cp.asarray(frame)
+        prev_frame_gpu = self.prev_frame
+        frame_gpu = 0.7 * frame_gpu + 0.3 * prev_frame_gpu
+        self.prev_frame = frame_gpu
+        frame = cp.asnumpy(frame_gpu)
         
-        plt.ioff()  # Turn off interactive mode
-        fig, ax = plt.subplots(figsize=(self.fig_width, self.fig_height), 
+        plt.ioff()
+        fig, ax = plt.subplots(figsize=(self.fig_width, self.fig_height),
                               facecolor=self.background_color)
         
-        # Adjust plot based on orientation
         if self.orientation == 'vertical':
             ax.set_xlim(-self.effective_amplitude, self.effective_amplitude)
             ax.set_ylim(0, self.frame_length)
@@ -140,41 +176,36 @@ class AudioVisualizer:
         ax.axis('off')
         fig.patch.set_facecolor(self.background_color)
         
-        # Apply subsampling and additional smoothing
         indices = range(0, self.frame_length, self.subsample_factor)
         subsampled_frame = frame[indices]
         
-        # Additional smoothing for visualization
         window_length = min(15, len(subsampled_frame) - 1)
         if window_length % 2 == 0:
             window_length -= 1
         if window_length >= 3:
             subsampled_frame = savgol_filter(subsampled_frame, window_length, 2)
         
-        # Add small baseline amplitude when signal is silent
         min_amplitude = 0.01
-        subsampled_frame = np.where(np.abs(subsampled_frame) < min_amplitude, 
-                                  min_amplitude * np.sign(subsampled_frame + 1e-10), 
+        subsampled_frame = np.where(np.abs(subsampled_frame) < min_amplitude,
+                                  min_amplitude * np.sign(subsampled_frame + 1e-10),
                                   subsampled_frame)
         
         if self.visualization_type == 'bars':
             if self.orientation == 'vertical':
                 ax.barh(indices, subsampled_frame * self.effective_amplitude,
-                   height=self.subsample_factor * 0.8,  # Reduced bar width for aesthetics
-                   color=self.color, align='edge', alpha=0.8)  # Added transparency
+                   height=self.subsample_factor * 0.8,
+                   color=self.color, align='edge', alpha=0.8)
             else:
                 ax.bar(indices, subsampled_frame * self.effective_amplitude,
-                  width=self.subsample_factor * 0.8,  # Reduced bar width for aesthetics
-                  color=self.color, align='edge', alpha=0.8)  # Added transparency
+                  width=self.subsample_factor * 0.8,
+                  color=self.color, align='edge', alpha=0.8)
         elif self.visualization_type == 'wave':
-            # Use cubic interpolation for smoother wave
             if self.orientation == 'vertical':
                 ax.plot(subsampled_frame * self.effective_amplitude, indices,
                    color=self.color, linewidth=2, alpha=0.8)
             else:
                 ax.plot(indices, subsampled_frame * self.effective_amplitude,
                    color=self.color, linewidth=2, alpha=0.8)
-                # Add baseline when signal is very quiet
                 if np.max(np.abs(subsampled_frame)) < min_amplitude:
                     ax.axhline(y=0, color=self.color, linewidth=1, alpha=0.5)
         elif self.visualization_type == 'spectrum':
@@ -186,7 +217,6 @@ class AudioVisualizer:
             else:
                 ax.imshow([[subsampled_spec]], aspect='auto', cmap=plt.cm.get_cmap('viridis'))
         
-        # Add time marker
         ax.text(0.02, 0.98, f"Time: {t:.2f}s", transform=ax.transAxes,
                 color=self.color, fontsize=10, alpha=0.7)
         
@@ -197,15 +227,15 @@ class AudioVisualizer:
         return img
 
     def create_frames_batch(self, batch):
-        return [self.create_frame(t) for t in batch]
+        with ThreadPoolExecutor() as executor:
+            return list(executor.map(self.create_frame, batch))
 
     def generate_video(self, output_path, progress_callback=None):
         total_frames = int(self.duration * self.fps)
         time_points = np.linspace(0, self.duration, total_frames, endpoint=False)
 
-        # Calculate output dimensions based on aspect ratio
         if self.orientation == 'horizontal':
-            width = 1920 if self.aspect_ratio == '16:9' else 1440  # 1440 for 4:3
+            width = 1920 if self.aspect_ratio == '16:9' else 1440
             height = width * self.height_ratio // self.width_ratio
         else:
             height = 1920 if self.aspect_ratio == '16:9' else 1440
@@ -214,13 +244,12 @@ class AudioVisualizer:
         if self.aspect_ratio == '1:1':
             width = height = 1080
 
-        # Create memory-mapped temporary file
         with tempfile.NamedTemporaryFile(suffix='.mmap', delete=False) as tmp:
             tmp_filename = tmp.name
             shape = (total_frames, self.target_height, self.target_width, 3)
             mmap_array = np.memmap(tmp_filename, dtype=np.uint8, mode='w+', shape=shape)
 
-        batch_size = 50  # Reduced batch size for better responsiveness
+        batch_size = 50
         num_batches = (total_frames + batch_size - 1) // batch_size
 
         for i in range(num_batches):
@@ -234,7 +263,7 @@ class AudioVisualizer:
             if progress_callback:
                 progress = int((i + 1) / num_batches * 100)
                 progress_callback.emit(progress)
-                QApplication.processEvents()  # Allow GUI updates
+                QApplication.processEvents()
 
         def make_frame(t):
             frame_index = min(int(t * self.fps), total_frames - 1)
@@ -243,7 +272,6 @@ class AudioVisualizer:
         video = VideoClip(make_frame, duration=self.duration)
         audio = AudioFileClip(self.audio_path)
         
-        # Create subtitle clips with improved styling
         subtitle_clips = []
         for chunk in self.subtitles:
             start = chunk["timestamp"][0]
@@ -251,9 +279,9 @@ class AudioVisualizer:
             text = chunk["text"]
             
             txt_clip = TextClip(
-                text, 
+                text,
                 fontsize=36,
-                font='Arial-Bold',
+                font='Arial-Bold', 
                 color=self.color,
                 bg_color=self.background_color,
                 size=(width * 0.8, None),
@@ -265,7 +293,6 @@ class AudioVisualizer:
             txt_clip = txt_clip.set_position(('center', 0.8), relative=True)
             subtitle_clips.append(txt_clip)
         
-        # Combine video with subtitles
         final_video = CompositeVideoClip([video.set_audio(audio)] + subtitle_clips)
 
         final_video.write_videofile(
@@ -275,16 +302,16 @@ class AudioVisualizer:
             audio_codec='aac',
             audio_bitrate='128k',
             preset='ultrafast',
-            threads=mp.cpu_count() // 2  # Use half of available CPU cores
+            threads=mp.cpu_count()
         )
 
-        # Clean up
         del mmap_array
         os.unlink(tmp_filename)
-        plt.close('all')  # Close any remaining figures
+        plt.close('all')
 
     def create_frames_batch(self,batch):
-        return [self.create_frame(t) for t in batch]
+        with ThreadPoolExecutor(max_workers=mp.cpu_count()) as executor:
+            return list(executor.map(self.create_frame, batch))
 
 class VideoGenerationThread(QThread):
     progress_updated = pyqtSignal(int)
@@ -362,13 +389,11 @@ class AudioVisualizerGUI(QMainWindow):
         
         layout = QVBoxLayout()
         
-        # Header
         header = QLabel("Advanced Audio Visualizer")
         header.setFont(QFont("Arial", 16, QFont.Bold))
         header.setAlignment(Qt.AlignCenter)
         layout.addWidget(header)
         
-        # File selection area
         file_layout = QHBoxLayout()
         self.input_label = QLabel("No audio file selected")
         self.input_label.setStyleSheet("padding: 8px; background: white; border-radius: 4px;")
@@ -379,10 +404,8 @@ class AudioVisualizerGUI(QMainWindow):
         file_layout.addWidget(self.select_button)
         layout.addLayout(file_layout)
         
-        # Settings group
         settings_layout = QHBoxLayout()
         
-        # Visualization type
         viz_layout = QVBoxLayout()
         viz_layout.addWidget(QLabel("Visualization Type:"))
         self.viz_type = QComboBox()
@@ -390,7 +413,6 @@ class AudioVisualizerGUI(QMainWindow):
         viz_layout.addWidget(self.viz_type)
         settings_layout.addLayout(viz_layout)
         
-        # FPS setting
         fps_layout = QVBoxLayout()
         fps_layout.addWidget(QLabel("FPS:"))
         self.fps_spinner = QSpinBox()
@@ -399,7 +421,6 @@ class AudioVisualizerGUI(QMainWindow):
         fps_layout.addWidget(self.fps_spinner)
         settings_layout.addLayout(fps_layout)
         
-        # Aspect ratio settings
         aspect_layout = QVBoxLayout()
         aspect_layout.addWidget(QLabel("Aspect Ratio:"))
         self.aspect_ratio = QComboBox()
@@ -407,7 +428,6 @@ class AudioVisualizerGUI(QMainWindow):
         aspect_layout.addWidget(self.aspect_ratio)
         settings_layout.addLayout(aspect_layout)
         
-        # Orientation settings
         orientation_layout = QVBoxLayout()
         orientation_layout.addWidget(QLabel("Orientation:"))
         self.orientation = QComboBox()
@@ -415,7 +435,6 @@ class AudioVisualizerGUI(QMainWindow):
         orientation_layout.addWidget(self.orientation)
         settings_layout.addLayout(orientation_layout)
         
-        # Color settings
         colors_layout = QVBoxLayout()
         colors_layout.addWidget(QLabel("Colors:"))
         color_buttons = QHBoxLayout()
@@ -428,7 +447,6 @@ class AudioVisualizerGUI(QMainWindow):
         
         layout.addLayout(settings_layout)
         
-        # Amplitude scale
         amplitude_layout = QVBoxLayout()
         amplitude_layout.addWidget(QLabel("Amplitude Scale:"))
         self.amplitude_slider = QSlider(Qt.Horizontal)
@@ -440,7 +458,6 @@ class AudioVisualizerGUI(QMainWindow):
         amplitude_layout.addWidget(self.amplitude_slider)
         layout.addLayout(amplitude_layout)
         
-        # Generate button and progress bar
         self.generate_button = QPushButton("Generate Video")
         self.generate_button.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
         self.generate_button.setEnabled(False)
@@ -449,25 +466,21 @@ class AudioVisualizerGUI(QMainWindow):
         self.progress_bar = QProgressBar()
         layout.addWidget(self.progress_bar)
         
-        # Status label
         self.status_label = QLabel("")
         self.status_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.status_label)
         
         main_widget.setLayout(layout)
         
-        # Connect signals
         self.select_button.clicked.connect(self.select_audio_file)
         self.generate_button.clicked.connect(self.generate_video)
         self.color_button.clicked.connect(self.select_color)
         self.bg_color_button.clicked.connect(self.select_bg_color)
         
-        # Initialize variables
         self.audio_path = None
         self.viz_color = "#000000"
         self.bg_color = "#FFFFFF"
         
-        # Add signal density control
         subsample_layout = QVBoxLayout()
         subsample_layout.addWidget(QLabel("Signal Density:"))
         self.subsample_spinner = QSpinBox()
@@ -477,10 +490,9 @@ class AudioVisualizerGUI(QMainWindow):
         subsample_layout.addWidget(self.subsample_spinner)
         settings_layout.addLayout(subsample_layout)
         
-        # Add timer for UI updates
         self.update_timer = QTimer()
         self.update_timer.timeout.connect(lambda: QApplication.processEvents())
-        self.update_timer.start(100)  # Update every 100ms
+        self.update_timer.start(100)
 
     def select_audio_file(self):
         file_dialog = QFileDialog()
@@ -559,7 +571,6 @@ class AudioVisualizerGUI(QMainWindow):
         self.progress_bar.setValue(0)
 
 if __name__ == '__main__':
-    # Set up logging
     logging.basicConfig(level=logging.INFO,
                        format='%(asctime)s - %(levelname)s - %(message)s')
     
