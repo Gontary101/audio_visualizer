@@ -6,6 +6,7 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from scipy.signal import savgol_filter
+
 import cupy as cp
 
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QPushButton, QFileDialog, 
@@ -58,9 +59,13 @@ def parallel_savgol(data, window_length, polyorder):
     return np.concatenate(results)
 
 class AudioVisualizer:
-    def __init__(self, audio_path, frame_length=2048, fps=30, amplitude_scale=40.0,
+    def __init__(self, audio_path, frame_length=2048, fps=30, amplitude_scale=80.0,
                  visualization_type='bars', color='#000000', background_color='#FFFFFF',
                  aspect_ratio='16:9', orientation='horizontal', subsample_factor=1):
+        # Set the backend before any plotting
+        matplotlib.use('Agg')
+        plt.ioff()  # Turn off interactive mode
+        
         self.audio_path = audio_path
         self.frame_length = frame_length
         self.fps = fps
@@ -83,8 +88,6 @@ class AudioVisualizer:
 
         if self.aspect_ratio == '1:1':
             self.target_width = self.target_height = 1080
-        
-        self.calculate_dimensions()
         
         try:
             # Load and process audio using GPU acceleration
@@ -147,131 +150,95 @@ class AudioVisualizer:
         else:
             self.effective_amplitude = self.amplitude_scale
             
-    def create_frame(self, t):
-        start_sample = int(t * self.sr)
-        end_sample = min(start_sample + self.frame_length, len(self.y))
-        frame = self.y[start_sample:end_sample]
-        
-        if len(frame) < self.frame_length:
-            frame = cp.pad(frame, (0, self.frame_length - len(frame)))
-            
-        # GPU-accelerated frame interpolation
-        frame_gpu = cp.asarray(frame)
-        prev_frame_gpu = self.prev_frame
-        frame_gpu = 0.7 * frame_gpu + 0.3 * prev_frame_gpu
-        self.prev_frame = frame_gpu
-        frame = cp.asnumpy(frame_gpu)
-        
-        plt.ioff()
-        fig, ax = plt.subplots(figsize=(self.fig_width, self.fig_height),
-                              facecolor=self.background_color)
-        
-        if self.orientation == 'vertical':
-            ax.set_xlim(-self.effective_amplitude, self.effective_amplitude)
-            ax.set_ylim(0, self.frame_length)
-        else:
-            ax.set_ylim(-self.effective_amplitude, self.effective_amplitude)
-            ax.set_xlim(0, self.frame_length)
-            
-        ax.axis('off')
-        fig.patch.set_facecolor(self.background_color)
-        
-        indices = range(0, self.frame_length, self.subsample_factor)
-        subsampled_frame = frame[indices]
-        
-        window_length = min(15, len(subsampled_frame) - 1)
-        if window_length % 2 == 0:
-            window_length -= 1
-        if window_length >= 3:
-            subsampled_frame = savgol_filter(subsampled_frame, window_length, 2)
-        
-        min_amplitude = 0.01
-        subsampled_frame = np.where(np.abs(subsampled_frame) < min_amplitude,
-                                  min_amplitude * np.sign(subsampled_frame + 1e-10),
-                                  subsampled_frame)
-        
-        if self.visualization_type == 'bars':
-            if self.orientation == 'vertical':
-                ax.barh(indices, subsampled_frame * self.effective_amplitude,
-                   height=self.subsample_factor * 0.8,
-                   color=self.color, align='edge', alpha=0.8)
-            else:
-                ax.bar(indices, subsampled_frame * self.effective_amplitude,
-                  width=self.subsample_factor * 0.8,
-                  color=self.color, align='edge', alpha=0.8)
-        elif self.visualization_type == 'wave':
-            if self.orientation == 'vertical':
-                ax.plot(subsampled_frame * self.effective_amplitude, indices,
-                   color=self.color, linewidth=2, alpha=0.8)
-            else:
-                ax.plot(indices, subsampled_frame * self.effective_amplitude,
-                   color=self.color, linewidth=2, alpha=0.8)
-                if np.max(np.abs(subsampled_frame)) < min_amplitude:
-                    ax.axhline(y=0, color=self.color, linewidth=1, alpha=0.5)
-        elif self.visualization_type == 'spectrum':
-            spec_slice = self.spec_db[:, int(t * self.fps)]
-            subsampled_spec = spec_slice[::self.subsample_factor]
-            if self.orientation == 'vertical':
-                ax.imshow([subsampled_spec], aspect='auto', cmap=plt.cm.get_cmap('viridis'),
-                         origin='lower', interpolation='nearest')
-            else:
-                ax.imshow([[subsampled_spec]], aspect='auto', cmap=plt.cm.get_cmap('viridis'))
-        
-        ax.text(0.02, 0.98, f"Time: {t:.2f}s", transform=ax.transAxes,
-                color=self.color, fontsize=10, alpha=0.7)
-        
-        img = mplfig_to_npimage(fig)
-        plt.close(fig)
-        img = resize(img, (self.target_height, self.target_width, 3), anti_aliasing=True)
-        img = (img * 255).astype(np.uint8)
-        return img
+    def create_mirrored_waveform(self, data):
+        """Create a mirrored waveform effect by duplicating and inverting the data."""
+        # Normalize the data to range [-1, 1]
+        normalized = data / np.max(np.abs(data))
+        # Create mirrored effect
+        mirrored = np.column_stack((normalized, -normalized))
+        return mirrored
 
-    def create_frames_batch(self, batch):
-        with ThreadPoolExecutor() as executor:
-            return list(executor.map(self.create_frame, batch))
+    def make_frame(self, t):
+        """Generate a frame for the video at time t."""
+        # Calculate frame data
+        frame_number = int(t * self.fps)
+        start_sample = int(frame_number * self.sr / self.fps)
+        end_sample = int((frame_number + 1) * self.sr / self.fps)
+        audio_segment = self.y[start_sample:end_sample]
+
+        # Create a new figure for this frame
+        fig = plt.figure(figsize=(self.target_width/100, self.target_height/100), dpi=100)
+        ax = fig.add_subplot(111)
+        
+        # Create time array and mirrored data
+        time = np.linspace(0, 1, len(audio_segment))
+        mirrored_data = self.create_mirrored_waveform(audio_segment)
+        visual_scale = self.amplitude_scale * 1.2
+
+        # Plot based on visualization type
+        if self.visualization_type == 'wave':
+            ax.plot(time, mirrored_data[:, 0] * visual_scale, color=self.color, linewidth=2.5, alpha=0.8)
+            ax.plot(time, mirrored_data[:, 1] * visual_scale, color=self.color, linewidth=2.5, alpha=0.8)
+            ax.fill_between(time, mirrored_data[:, 0] * visual_scale, 
+                          mirrored_data[:, 1] * visual_scale,
+                          color=self.color, alpha=0.2)
+        
+        elif self.visualization_type == 'bars':
+            num_bars = len(audio_segment) // self.subsample_factor
+            bar_width = 0.8 / num_bars
+            bar_heights = mirrored_data[::self.subsample_factor] * visual_scale
+            bar_positions = np.linspace(0, 1, num_bars)
+            
+            for i, (pos, heights) in enumerate(zip(bar_positions, bar_heights)):
+                # Calculate alpha value and clamp it between 0 and 1
+                alpha_base = np.abs(heights[0] / visual_scale)
+                alpha = np.clip(0.7 + 0.3 * alpha_base, 0.3, 1.0)
+                ax.bar(pos, heights[0], bar_width, color=self.color, alpha=alpha)
+                ax.bar(pos, heights[1], bar_width, color=self.color, alpha=alpha)
+        
+        elif self.visualization_type == 'waveform':
+            ax.plot(time, mirrored_data[:, 0] * visual_scale, color=self.color, linewidth=2.5)
+            ax.plot(time, mirrored_data[:, 1] * visual_scale, color=self.color, linewidth=2.5)
+            ax.fill_between(time, mirrored_data[:, 0] * visual_scale, 
+                          mirrored_data[:, 1] * visual_scale,
+                          color=self.color, alpha=0.25)
+
+        # Configure plot aesthetics
+        ax.set_xlim(0, 1)
+        ax.set_ylim(-visual_scale * 1.1, visual_scale * 1.1)
+        ax.axis('off')
+        
+        # Set colors
+        fig.patch.set_facecolor(self.background_color)
+        ax.set_facecolor(self.background_color)
+        
+        # Adjust layout
+        plt.tight_layout(pad=0)
+        
+        # Convert to image
+        canvas = fig.canvas
+        canvas.draw()
+        
+        # Get the image data
+        width, height = fig.get_size_inches() * fig.get_dpi()
+        image = np.frombuffer(canvas.tostring_rgb(), dtype='uint8')
+        image = image.reshape(int(height), int(width), 3)
+        
+        # Clean up
+        plt.close(fig)
+        
+        return image
 
     def generate_video(self, output_path, progress_callback=None):
-        total_frames = int(self.duration * self.fps)
-        time_points = np.linspace(0, self.duration, total_frames, endpoint=False)
-
-        if self.orientation == 'horizontal':
-            width = 1920 if self.aspect_ratio == '16:9' else 1440
-            height = width * self.height_ratio // self.width_ratio
-        else:
-            height = 1920 if self.aspect_ratio == '16:9' else 1440
-            width = height * self.height_ratio // self.width_ratio
-
-        if self.aspect_ratio == '1:1':
-            width = height = 1080
-
-        with tempfile.NamedTemporaryFile(suffix='.mmap', delete=False) as tmp:
-            tmp_filename = tmp.name
-            shape = (total_frames, self.target_height, self.target_width, 3)
-            mmap_array = np.memmap(tmp_filename, dtype=np.uint8, mode='w+', shape=shape)
-
-        batch_size = 50
-        num_batches = (total_frames + batch_size - 1) // batch_size
-
-        for i in range(num_batches):
-            start = i * batch_size
-            end = min((i + 1) * batch_size, total_frames)
-            batch = time_points[start:end]
-            
-            frames = self.create_frames_batch(batch)
-            mmap_array[start:end] = [np.array(frame) for frame in frames]
-
-            if progress_callback:
-                progress = int((i + 1) / num_batches * 100)
-                progress_callback.emit(progress)
-                QApplication.processEvents()
-
-        def make_frame(t):
-            frame_index = min(int(t * self.fps), total_frames - 1)
-            return mmap_array[frame_index]
-
-        video = VideoClip(make_frame, duration=self.duration)
-        audio = AudioFileClip(self.audio_path)
+        """Generate the video with the visualization and subtitles."""
+        # Create VideoClip with the make_frame method
+        clip = VideoClip(self.make_frame, duration=self.duration)
         
+        # Add audio
+        audio = AudioFileClip(self.audio_path)
+        video = clip.set_audio(audio)
+        
+        # Create subtitle clips
         subtitle_clips = []
         for chunk in self.subtitles:
             start = chunk["timestamp"][0]
@@ -284,7 +251,7 @@ class AudioVisualizer:
                 font='Arial-Bold', 
                 color=self.color,
                 bg_color=self.background_color,
-                size=(width * 0.8, None),
+                size=(self.target_width * 0.8, None),
                 method='caption',
                 stroke_color=self.color,
                 stroke_width=1
@@ -293,25 +260,34 @@ class AudioVisualizer:
             txt_clip = txt_clip.set_position(('center', 0.8), relative=True)
             subtitle_clips.append(txt_clip)
         
-        final_video = CompositeVideoClip([video.set_audio(audio)] + subtitle_clips)
-
+        # Combine video with subtitles
+        final_video = CompositeVideoClip([video] + subtitle_clips)
+        
+        # Write the video file
         final_video.write_videofile(
             output_path,
             fps=self.fps,
             codec='libx264',
             audio_codec='aac',
             audio_bitrate='128k',
-            preset='ultrafast',
+            preset='medium',
             threads=mp.cpu_count()
         )
+        
+        # Clean up
+        audio.close()
+        video.close()
+        final_video.close()
+        for clip in subtitle_clips:
+            clip.close()
 
-        del mmap_array
-        os.unlink(tmp_filename)
-        plt.close('all')
-
-    def create_frames_batch(self,batch):
+    def create_frames_batch(self, batch):
         with ThreadPoolExecutor(max_workers=mp.cpu_count()) as executor:
-            return list(executor.map(self.create_frame, batch))
+            return list(executor.map(self.make_frame, batch))
+
+    def __del__(self):
+        # Clean up the figure when the object is destroyed
+        plt.close('all')
 
 class VideoGenerationThread(QThread):
     progress_updated = pyqtSignal(int)
@@ -409,7 +385,7 @@ class AudioVisualizerGUI(QMainWindow):
         viz_layout = QVBoxLayout()
         viz_layout.addWidget(QLabel("Visualization Type:"))
         self.viz_type = QComboBox()
-        self.viz_type.addItems(['bars', 'wave', 'spectrum'])
+        self.viz_type.addItems(['bars', 'wave', 'spectrum', 'waveform'])
         viz_layout.addWidget(self.viz_type)
         settings_layout.addLayout(viz_layout)
         
@@ -452,7 +428,7 @@ class AudioVisualizerGUI(QMainWindow):
         self.amplitude_slider = QSlider(Qt.Horizontal)
         self.amplitude_slider.setMinimum(100)
         self.amplitude_slider.setMaximum(1000)
-        self.amplitude_slider.setValue(400)
+        self.amplitude_slider.setValue(800)
         self.amplitude_slider.setTickPosition(QSlider.TicksBelow)
         self.amplitude_slider.setTickInterval(100)
         amplitude_layout.addWidget(self.amplitude_slider)
